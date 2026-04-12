@@ -109,6 +109,11 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
         "response_queue": response_queue,
     }
     cli._secret_deadline = _time.monotonic() + timeout
+    if hasattr(cli, "_set_runtime_status_from_state"):
+        try:
+            cli._set_runtime_status_from_state()
+        except Exception:
+            pass
     # Avoid storing stale draft input as the secret when Enter is pressed.
     if hasattr(cli, "_clear_secret_input_buffer"):
         try:
@@ -129,6 +134,11 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
             value = response_queue.get(timeout=1)
             cli._secret_state = None
             cli._secret_deadline = 0
+            if hasattr(cli, "_set_runtime_status_from_state"):
+                try:
+                    cli._set_runtime_status_from_state()
+                except Exception:
+                    pass
             if hasattr(cli, "_app") and cli._app:
                 cli._app.invalidate()
 

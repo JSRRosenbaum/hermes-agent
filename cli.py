@@ -1824,6 +1824,14 @@ class HermesCLI:
         self._tool_start_time: float = 0.0  # monotonic timestamp when current tool started (for live elapsed)
         self._command_running = False
         self._command_status = ""
+        self._title_topic = "Idle"
+        self._title_status = "waiting"
+        self._last_prompt_topic = ""
+        self._last_emitted_terminal_title = ""
+        self._title_spin_index = 0
+        self._title_animating = False
+        self._title_spinner_frames = ("◴", "◷", "◶", "◵")
+        self._title_idle_icon = "★"
         self._attached_images: list[Path] = []
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
@@ -1870,6 +1878,146 @@ class HermesCLI:
         safe_percent = max(0, min(100, percent_used or 0))
         filled = round((safe_percent / 100) * width)
         return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
+
+    def _summarize_runtime_topic(self, text: str, max_len: int = 56) -> str:
+        """Return a compact, terminal-safe topic label for dynamic titles."""
+        try:
+            text = " ".join(str(text or "").replace("\n", " ").split())
+        except Exception:
+            text = ""
+        text = text.strip(" -:;,.|•")
+        if not text:
+            return "Idle"
+        if len(text) > max_len:
+            return text[: max_len - 1].rstrip() + "…"
+        return text
+
+    def _get_session_title_for_runtime(self) -> Optional[str]:
+        if not getattr(self, "_session_db", None) or not getattr(self, "session_id", None):
+            return None
+        try:
+            session = self._session_db.get_session(self.session_id)
+            if session and session.get("title"):
+                return str(session["title"]).strip() or None
+        except Exception:
+            pass
+        try:
+            title = self._session_db.get_session_title(self.session_id)
+            return (str(title).strip() or None) if title else None
+        except Exception:
+            return None
+
+    def _runtime_title_prefix(self) -> str:
+        """Return animated spinner prefix for active states, star for idle/complete."""
+        status = getattr(self, "_title_status", "waiting") or "waiting"
+        if status in {"thinking", "working", "tool", "command", "voice"}:
+            frames = getattr(self, "_title_spinner_frames", ("*",))
+            idx = getattr(self, "_title_spin_index", 0) % len(frames)
+            return frames[idx]
+        return getattr(self, "_title_idle_icon", "★")
+
+    def _compose_runtime_title(self) -> str:
+        topic = (
+            self._get_session_title_for_runtime()
+            or getattr(self, "_pending_title", None)
+            or self._title_topic
+            or self._last_prompt_topic
+            or "Idle"
+        )
+        topic = self._summarize_runtime_topic(topic)
+        prefix = self._runtime_title_prefix()
+        return f"{prefix} {topic} - hermes"[:220]
+
+    def _title_animation_loop(self) -> None:
+        """Animate terminal-title spinner while Hermes is active."""
+        while getattr(self, "_title_animating", False):
+            try:
+                self._title_spin_index = (getattr(self, "_title_spin_index", 0) + 1) % len(self._title_spinner_frames)
+                self._last_emitted_terminal_title = ""
+                self._emit_terminal_title()
+                time.sleep(0.35)
+            except Exception:
+                break
+
+    def _sync_title_animation(self) -> None:
+        animated = (getattr(self, "_title_status", "waiting") or "waiting") in {"thinking", "working", "tool", "command", "voice"}
+        if animated and not getattr(self, "_title_animating", False):
+            self._title_animating = True
+            threading.Thread(target=self._title_animation_loop, daemon=True, name="hermes-title-spinner").start()
+        elif not animated and getattr(self, "_title_animating", False):
+            self._title_animating = False
+            self._title_spin_index = 0
+            self._last_emitted_terminal_title = ""
+
+    def _emit_terminal_title(self) -> None:
+        """Best-effort terminal/tab title refresh without writing into TUI stdout."""
+        title = self._compose_runtime_title()
+        if title == getattr(self, "_last_emitted_terminal_title", ""):
+            return
+        self._last_emitted_terminal_title = title
+
+        emitted = False
+        app = getattr(self, "_app", None)
+        output = getattr(app, "output", None) if app else None
+        if output is not None:
+            try:
+                set_title = getattr(output, "set_title", None)
+                if callable(set_title):
+                    set_title(title)
+                    emitted = True
+            except Exception:
+                pass
+
+        if not emitted:
+            try:
+                with open("/dev/tty", "w", encoding="utf-8", errors="ignore") as tty:
+                    tty.write(f"\033]2;{title}\007")
+                    tty.flush()
+                    emitted = True
+            except Exception:
+                pass
+
+        if emitted and os.environ.get("TMUX"):
+            try:
+                os.system(f"tmux rename-window {json.dumps(title)} >/dev/null 2>&1")
+            except Exception:
+                pass
+
+    def _set_runtime_status_from_state(self) -> None:
+        """Derive runtime status from the current interactive state."""
+        if getattr(self, "_secret_state", None):
+            status = "waiting"
+        elif getattr(self, "_sudo_state", None):
+            status = "waiting"
+        elif getattr(self, "_approval_state", None):
+            status = "waiting"
+        elif getattr(self, "_clarify_freetext", False) or getattr(self, "_clarify_state", None):
+            status = "waiting"
+        elif getattr(self, "_voice_processing", False):
+            status = "voice"
+        elif getattr(self, "_command_running", False):
+            status = "command"
+        elif getattr(self, "_agent_running", False) and getattr(self, "_spinner_text", ""):
+            status = "thinking"
+        elif getattr(self, "_agent_running", False):
+            status = "working"
+        else:
+            status = "waiting"
+        self._title_status = status
+        self._sync_title_animation()
+        self._emit_terminal_title()
+
+    def _refresh_runtime_title(self, *, topic: Optional[str] = None, status: Optional[str] = None) -> None:
+        """Update topic/status and refresh the terminal title."""
+        if topic is not None:
+            summarized = self._summarize_runtime_topic(topic)
+            self._title_topic = summarized
+            if summarized != "Idle":
+                self._last_prompt_topic = summarized
+        if status is not None:
+            self._title_status = status
+        self._sync_title_animation()
+        self._emit_terminal_title()
 
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
@@ -2234,6 +2382,7 @@ class HermesCLI:
             self._flush_reasoning_preview(force=True)
         self._spinner_text = text or ""
         self._tool_start_time = 0.0  # clear tool timer when switching to thinking
+        self._set_runtime_status_from_state()
         self._invalidate()
 
     # ── Streaming display ────────────────────────────────────────────────
@@ -2646,6 +2795,7 @@ class HermesCLI:
         """Expose a temporary busy state in the TUI while a slash command runs."""
         self._command_running = True
         self._command_status = status
+        self._set_runtime_status_from_state()
         self._invalidate(min_interval=0.0)
         try:
             print(f"⏳ {status}")
@@ -2653,6 +2803,7 @@ class HermesCLI:
         finally:
             self._command_running = False
             self._command_status = ""
+            self._set_runtime_status_from_state()
             self._invalidate(min_interval=0.0)
 
     def _ensure_runtime_credentials(self) -> bool:
@@ -2908,10 +3059,12 @@ class HermesCLI:
                 try:
                     self._session_db.set_session_title(self.session_id, self._pending_title)
                     _cprint(f"  Session title applied: {self._pending_title}")
+                    self._refresh_runtime_title(topic=self._pending_title)
                     self._pending_title = None
                 except (ValueError, Exception) as e:
                     _cprint(f"  Could not apply pending title: {e}")
                     self._pending_title = None
+            self._emit_terminal_title()
             return True
         except Exception as e:
             ChatConsole().print(f"[bold red]Failed to initialize agent: {e}[/]")
@@ -3987,6 +4140,10 @@ class HermesCLI:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
+        self._title_topic = "Idle"
+        self._title_status = "waiting"
+        self._last_prompt_topic = ""
+        self._last_emitted_terminal_title = ""
 
         if self.agent:
             self.agent.session_id = self.session_id
@@ -4017,6 +4174,8 @@ class HermesCLI:
                 except Exception:
                     pass
             self._notify_session_boundary("on_session_reset")
+
+        self._emit_terminal_title()
 
         if not silent:
             print("(^_^)v New session started!")
@@ -5267,6 +5426,7 @@ class HermesCLI:
                             try:
                                 if self._session_db.set_session_title(self.session_id, new_title):
                                     _cprint(f"  Session title set: {new_title}")
+                                    self._refresh_runtime_title(topic=new_title)
                                 else:
                                     _cprint("  Session not found in database.")
                             except ValueError as e:
@@ -5279,6 +5439,7 @@ class HermesCLI:
                                 _cprint(f"  Title '{new_title}' is already in use by session {existing['id']}")
                             else:
                                 self._pending_title = new_title
+                                self._refresh_runtime_title(topic=new_title)
                                 _cprint(f"  Session title queued: {new_title} (will be saved on first message)")
                     else:
                         _cprint("  Session database not available.")
@@ -6564,6 +6725,7 @@ class HermesCLI:
         if event_type == "tool.completed":
             import time as _time
             self._tool_start_time = 0.0
+            self._set_runtime_status_from_state()
             self._invalidate()
             return
         if event_type != "tool.started":
@@ -6579,6 +6741,7 @@ class HermesCLI:
                 label = label[:_pl - 3] + "..."
             self._spinner_text = f"{emoji} {label}"
             self._tool_start_time = _time.monotonic()
+            self._refresh_runtime_title(status="tool")
             self._invalidate()
 
         if not self._voice_mode:
@@ -7052,6 +7215,7 @@ class HermesCLI:
         # Open-ended questions skip straight to freetext input
         self._clarify_freetext = is_open_ended
 
+        self._set_runtime_status_from_state()
         # Trigger prompt_toolkit repaint from this (non-main) thread
         self._invalidate()
 
@@ -7087,6 +7251,7 @@ class HermesCLI:
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
+        self._set_runtime_status_from_state()
         self._invalidate()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
         return (
@@ -7113,6 +7278,7 @@ class HermesCLI:
         }
         self._sudo_deadline = _time.monotonic() + timeout
 
+        self._set_runtime_status_from_state()
         self._invalidate()
 
         while True:
@@ -7121,6 +7287,7 @@ class HermesCLI:
                 self._sudo_state = None
                 self._sudo_deadline = 0
                 self._restore_modal_input_snapshot()
+                self._set_runtime_status_from_state()
                 self._invalidate()
                 if result:
                     _cprint(f"\n{_DIM}  ✓ Password received (cached for session){_RST}")
@@ -7136,6 +7303,7 @@ class HermesCLI:
         self._sudo_state = None
         self._sudo_deadline = 0
         self._restore_modal_input_snapshot()
+        self._set_runtime_status_from_state()
         self._invalidate()
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
         return ""
@@ -7170,6 +7338,7 @@ class HermesCLI:
             }
             self._approval_deadline = _time.monotonic() + timeout
 
+            self._set_runtime_status_from_state()
             self._invalidate()
 
             _last_countdown_refresh = _time.monotonic()
@@ -7178,6 +7347,7 @@ class HermesCLI:
                     result = response_queue.get(timeout=1)
                     self._approval_state = None
                     self._approval_deadline = 0
+                    self._set_runtime_status_from_state()
                     self._invalidate()
                     return result
                 except queue.Empty:
@@ -7191,6 +7361,7 @@ class HermesCLI:
 
             self._approval_state = None
             self._approval_deadline = 0
+            self._set_runtime_status_from_state()
             self._invalidate()
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
             return "deny"
@@ -7224,6 +7395,7 @@ class HermesCLI:
 
         state["response_queue"].put(chosen)
         self._approval_state = None
+        self._set_runtime_status_from_state()
         self._invalidate()
 
     def _get_approval_display_fragments(self):
@@ -7341,6 +7513,7 @@ class HermesCLI:
         self._secret_state["response_queue"].put(value)
         self._secret_state = None
         self._secret_deadline = 0
+        self._set_runtime_status_from_state()
         self._invalidate()
 
     def _cancel_secret_capture(self) -> None:
@@ -7376,8 +7549,14 @@ class HermesCLI:
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
 
+        if isinstance(message, str):
+            self._refresh_runtime_title(topic=message, status="thinking")
+        else:
+            self._refresh_runtime_title(status="thinking")
+
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
+            self._set_runtime_status_from_state()
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
@@ -7641,6 +7820,7 @@ class HermesCLI:
                         response,
                         self.conversation_history,
                     )
+                    self._refresh_runtime_title(topic=self._get_session_title_for_runtime() or message)
                 except Exception:
                     pass
 
@@ -7748,6 +7928,7 @@ class HermesCLI:
             # In "queue" mode Enter routes directly to _pending_input so this
             # block is never hit.
             if pending_message and hasattr(self, '_pending_input'):
+                self._refresh_runtime_title(topic=pending_message, status="thinking")
                 all_parts = [pending_message]
                 while not self._interrupt_queue.empty():
                     try:
@@ -8109,10 +8290,16 @@ class HermesCLI:
         self._voice_tts_done = threading.Event()  # Signals TTS playback finished
         self._voice_tts_done.set()  # Initially "done" (no TTS pending)
 
+        self._title_topic = "Idle"
+        self._title_status = "waiting"
+        self._last_prompt_topic = ""
+        self._last_emitted_terminal_title = ""
+
         # Register callbacks so terminal_tool prompts route through our UI
         set_sudo_password_callback(self._sudo_password_callback)
         set_approval_callback(self._approval_callback)
         set_secret_capture_callback(self._secret_capture_callback)
+        self._emit_terminal_title()
 
         # Ensure tirith security scanner is available (downloads if needed).
         # Warn the user if tirith is enabled in config but not available,
@@ -9411,6 +9598,7 @@ class HermesCLI:
 
                     # Regular chat - run agent
                     self._agent_running = True
+                    self._set_runtime_status_from_state()
                     app.invalidate()  # Refresh status line
 
                     try:
@@ -9419,6 +9607,7 @@ class HermesCLI:
                         self._agent_running = False
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
+                        self._set_runtime_status_from_state()
 
                         app.invalidate()  # Refresh status line
 
