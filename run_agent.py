@@ -1394,6 +1394,9 @@ class AIAgent:
         if not isinstance(_agent_section, dict):
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+        self._final_response_enforcement = str(
+            _agent_section.get("final_response_enforcement", "heuristic")
+        ).strip().lower() or "heuristic"
 
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
@@ -2218,7 +2221,7 @@ class AIAgent:
 
         return not self._has_natural_response_ending(visible_text)
 
-    def _looks_like_codex_intermediate_ack(
+    def _looks_like_intermediate_ack(
         self,
         user_message: str,
         assistant_content: str,
@@ -2288,6 +2291,301 @@ class AIAgent:
             marker in assistant_text for marker in workspace_markers
         )
         return (user_targets_workspace or assistant_targets_workspace) and assistant_mentions_action
+
+    def _looks_like_codex_intermediate_ack(
+        self,
+        user_message: str,
+        assistant_content: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Backward-compatible alias for the older Codex-specific helper name."""
+        return self._looks_like_intermediate_ack(
+            user_message=user_message,
+            assistant_content=assistant_content,
+            messages=messages,
+        )
+
+    def _has_blocked_boundary_evidence(
+        self,
+        assistant_lower: str,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Require corroborating tool-result evidence from the current tool-call block, tolerating enforcement retry wrappers."""
+        if not messages:
+            return False
+
+        evidence_markers = []
+        if any(phrase in assistant_lower for phrase in (
+            "credential",
+            "credentials",
+            "permission denied",
+            "don't have access",
+            "do not have access",
+            "can't access",
+            "cannot access",
+        )):
+            evidence_markers.extend((
+                "permission denied",
+                "missing credentials",
+                "credential",
+                "credentials",
+                "unauthorized",
+                "forbidden",
+                "access denied",
+                "401",
+                "403",
+            ))
+
+        if any(phrase in assistant_lower for phrase in (
+            "approval",
+            "awaiting approval",
+            "need approval",
+        )):
+            evidence_markers.extend((
+                "approval required",
+                "awaiting approval",
+                "requires approval",
+                "need approval",
+                "approval needed",
+            ))
+
+        if any(phrase in assistant_lower for phrase in (
+            "tool unavailable",
+            "tools unavailable",
+            "tool not available",
+            "tools not available",
+            "not available in this environment",
+            "not available on this machine",
+        )):
+            evidence_markers.extend((
+                "tool unavailable",
+                "tools unavailable",
+                "tool not available",
+                "tools not available",
+                "not available in this environment",
+                "not available on this machine",
+                "unsupported tool",
+            ))
+
+        if not evidence_markers:
+            return False
+
+        system_continue_prompt = (
+            "[system: do not stop on narration, future intentions, or progress summaries. "
+            "if tools are available, use them now to make progress. only give a text final "
+            "answer if the task is actually complete or explicitly blocked by a real boundary.]"
+        )
+
+        trailing_tool_messages = []
+        idx = len(messages) - 1
+        while idx >= 0:
+            msg = messages[idx]
+            if not isinstance(msg, dict):
+                idx -= 1
+                continue
+
+            role = msg.get("role")
+            if role == "tool":
+                trailing_tool_messages.append(msg)
+                idx -= 1
+                continue
+
+            if role == "user":
+                content = self._strip_think_blocks(str(msg.get("content", ""))).strip().lower()
+                if content == system_continue_prompt:
+                    idx -= 1
+                    continue
+                break
+
+            if role == "assistant":
+                finish_reason = str(msg.get("finish_reason") or "").strip().lower()
+                if finish_reason == "incomplete":
+                    idx -= 1
+                    continue
+                break
+
+            break
+
+        if not trailing_tool_messages:
+            return False
+
+        if idx < 0:
+            return False
+        assistant_msg = messages[idx]
+        if not isinstance(assistant_msg, dict) or assistant_msg.get("role") != "assistant":
+            return False
+
+        tool_calls = assistant_msg.get("tool_calls") or []
+        if not tool_calls:
+            return False
+
+        expected_tool_call_ids = {
+            getattr(tc, "id", None) if not isinstance(tc, dict) else tc.get("id")
+            for tc in tool_calls
+        }
+        expected_tool_call_ids.discard(None)
+        if not expected_tool_call_ids:
+            return False
+
+        trailing_tool_call_ids = {
+            msg.get("tool_call_id")
+            for msg in trailing_tool_messages
+            if msg.get("tool_call_id") is not None
+        }
+        if not trailing_tool_call_ids or not trailing_tool_call_ids.issubset(expected_tool_call_ids):
+            return False
+
+        evidence_markers = tuple(dict.fromkeys(evidence_markers))
+        for msg in trailing_tool_messages:
+            tool_content = self._strip_think_blocks(str(msg.get("content", ""))).strip().lower()
+            if any(marker in tool_content for marker in evidence_markers):
+                return True
+        return False
+
+    def _should_reject_final_text_response(
+        self,
+        user_message: str,
+        assistant_content: str,
+        messages: List[Dict[str, Any]],
+        tool_used_this_turn: bool,
+    ) -> bool:
+        """Reject narration-only text finals when tools are available for operational work."""
+        mode = str(getattr(self, "_final_response_enforcement", "heuristic") or "heuristic").strip().lower()
+        if mode in ("", "false", "off", "no", "0", "disabled"):
+            return False
+        if not self.valid_tool_names:
+            return False
+        if tool_used_this_turn:
+            return False
+
+        assistant_text = self._strip_think_blocks(assistant_content or "").strip()
+        if not assistant_text:
+            return False
+
+        assistant_lower = assistant_text.lower()
+        user_lower = (user_message or "").strip().lower()
+
+        if self._has_blocked_boundary_evidence(assistant_lower, messages):
+            return False
+
+        blocked_claim_markers = (
+            "i can't access",
+            "i cannot access",
+            "don't have access",
+            "do not have access",
+            "don't have the required",
+            "do not have the required",
+            "missing credentials",
+            "need credentials",
+            "permission denied",
+            "tool is unavailable",
+            "tools are unavailable",
+            "tool not available",
+            "tools not available",
+            "not available in this environment",
+            "not available on this machine",
+            "i need approval",
+            "awaiting approval",
+            "requires approval",
+        )
+        has_unverified_blocked_claim = any(marker in assistant_lower for marker in blocked_claim_markers)
+
+        conceptual_markers = (
+            "explain",
+            "what is",
+            "what's",
+            "how does",
+            "how do",
+            "why does",
+            "why is",
+            "describe",
+            "conceptually",
+            "in simple terms",
+            "difference between",
+            "compare",
+            "summarize",
+            "summary of",
+        )
+        operational_markers = (
+            "check",
+            "inspect",
+            "look at",
+            "look into",
+            "run",
+            "test",
+            "debug",
+            "search",
+            "find",
+            "read",
+            "open",
+            "patch",
+            "modify",
+            "edit",
+            "build",
+            "deploy",
+            "fix",
+            "list",
+            "show me",
+        )
+
+        is_conceptual_request = any(marker in user_lower for marker in conceptual_markers)
+        is_operational_request = any(marker in user_lower for marker in operational_markers)
+        if not is_operational_request and mode != "strict":
+            return False
+        if is_conceptual_request and not is_operational_request:
+            return False
+
+        future_ack_patterns = (
+            r"\bi['’]ll\b",
+            r"\bi will\b",
+            r"\blet me\b",
+            r"\bnext i['’]?m going to\b",
+            r"\bi can do that\b",
+            r"\bthe next step is\b",
+            r"\bi['’]ll proceed by\b",
+            r"\bi can help with that\b",
+        )
+        has_future_ack = any(re.search(pattern, assistant_lower) for pattern in future_ack_patterns)
+        if has_future_ack:
+            return True
+
+        status_only_patterns = (
+            "i'm working on",
+            "i am working on",
+            "in progress",
+            "still working",
+            "i've started",
+            "i have started",
+            "currently checking",
+            "currently looking",
+            "i'm blocked by",
+            "i am blocked by",
+            "i need approval",
+            "awaiting approval",
+        )
+        if any(marker in assistant_lower for marker in status_only_patterns):
+            return True
+
+        if has_unverified_blocked_claim:
+            return True
+
+        if mode == "strict" and is_operational_request:
+            completed_markers = (
+                "i found",
+                "here's",
+                "here is",
+                "the result",
+                "completed",
+                "done:",
+                "done.",
+                "pass",
+                "failed",
+                "succeeded",
+            )
+            if not any(marker in assistant_lower for marker in completed_markers):
+                return True
+
+        return False
     
     
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
@@ -8681,6 +8979,8 @@ class AIAgent:
         final_response = None
         interrupted = False
         codex_ack_continuations = 0
+        final_response_retries = 0
+        tool_used_this_turn = False
         length_continue_retries = 0
         truncated_tool_call_retries = 0
         truncated_response_prefix = ""
@@ -8727,6 +9027,7 @@ class AIAgent:
                 pass
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
+            tool_used_this_turn = False
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -10934,6 +11235,26 @@ class AIAgent:
                             pass
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    recent_tool_msgs = [
+                        m for m in messages[-len(assistant_message.tool_calls):]
+                        if isinstance(m, dict) and m.get("role") == "tool"
+                    ]
+                    tool_used_this_turn = any(
+                        not _detect_tool_failure(
+                            (next(
+                                (
+                                    tc.function.name
+                                    for tc in assistant_message.tool_calls
+                                    if getattr(tc, "id", None) == msg.get("tool_call_id")
+                                ),
+                                "",
+                            )),
+                            msg.get("content", ""),
+                        )[0]
+                        and "tool execution cancelled" not in str(msg.get("content", "")).lower()
+                        and "skipped due to user interrupt" not in str(msg.get("content", "")).lower()
+                        for msg in recent_tool_msgs
+                    )
 
                     # Reset per-turn retry counters after successful tool
                     # execution so a single truncation doesn't poison the
@@ -11243,6 +11564,67 @@ class AIAgent:
                     # Reset retry counter/signature on successful content
                     self._empty_content_retries = 0
                     self._thinking_prefill_retries = 0
+
+                    if (
+                        self.valid_tool_names
+                        and final_response_retries < 2
+                        and self._should_reject_final_text_response(
+                            user_message=original_user_message,
+                            assistant_content=final_response,
+                            messages=messages,
+                            tool_used_this_turn=tool_used_this_turn,
+                        )
+                    ):
+                        final_response_retries += 1
+                        interim_msg = self._build_assistant_message(assistant_message, "incomplete")
+                        messages.append(interim_msg)
+                        self._emit_interim_assistant_message(interim_msg)
+
+                        continue_msg = {
+                            "role": "user",
+                            "content": (
+                                "[System: Do not stop on narration, future intentions, or progress summaries. "
+                                "If tools are available, use them now to make progress. Only give a text final "
+                                "answer if the task is actually complete or explicitly blocked by a real boundary.]"
+                            ),
+                        }
+                        messages.append(continue_msg)
+                        self._session_messages = messages
+                        self._save_session_log(messages)
+                        continue
+
+                    if (
+                        self.valid_tool_names
+                        and final_response_retries >= 2
+                        and self._should_reject_final_text_response(
+                            user_message=original_user_message,
+                            assistant_content=final_response,
+                            messages=messages,
+                            tool_used_this_turn=tool_used_this_turn,
+                        )
+                    ):
+                        _turn_exit_reason = "final_response_rejection_exhausted"
+                        rejected_final_msg = self._build_assistant_message(assistant_message, finish_reason)
+                        while (
+                            messages
+                            and isinstance(messages[-1], dict)
+                            and messages[-1].get("_thinking_prefill")
+                        ):
+                            messages.pop()
+                        messages.append(rejected_final_msg)
+                        final_response = None
+                        self._cleanup_task_resources(effective_task_id)
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": None,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "partial": True,
+                            "error": "Model repeatedly responded with narration instead of using available tools.",
+                        }
+
+                    final_response_retries = 0
 
                     if (
                         self.api_mode == "codex_responses"

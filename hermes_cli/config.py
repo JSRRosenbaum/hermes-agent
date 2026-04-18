@@ -366,6 +366,12 @@ DEFAULT_CONFIG = {
         # (force on/off for all models), or a list of model-name substrings
         # to match (e.g. ["gpt", "codex", "gemini", "qwen"]).
         "tool_use_enforcement": "auto",
+        # Final-response enforcement: reject text-only "I'll check" / progress
+        # narration when tools are available and the task is operational.
+        # Values: "off" (disabled), "heuristic" (default — reject obvious
+        # narration-only stops), "strict" (broader rejection of operational
+        # zero-tool turns unless clearly complete or blocked).
+        "final_response_enforcement": "heuristic",
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.

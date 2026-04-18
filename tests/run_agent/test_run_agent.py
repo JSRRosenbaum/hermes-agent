@@ -856,6 +856,162 @@ class TestInvalidateSystemPrompt:
         mock_store.load_from_disk.assert_called_once()
 
 
+class TestFinalResponseEnforcementConfig:
+    """Tests for the agent.final_response_enforcement config option."""
+
+    def _make_agent(self, final_response_enforcement="heuristic"):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal", "web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"final_response_enforcement": final_response_enforcement}},
+            ),
+        ):
+            a = AIAgent(
+                model="openai/gpt-4.1",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_default_is_heuristic(self):
+        agent = self._make_agent(final_response_enforcement="heuristic")
+        assert agent._final_response_enforcement == "heuristic"
+
+    def test_strict_is_loaded_from_config(self):
+        agent = self._make_agent(final_response_enforcement="strict")
+        assert agent._final_response_enforcement == "strict"
+
+    def test_false_like_values_disable_enforcement(self):
+        agent = self._make_agent(final_response_enforcement="off")
+        assert agent._final_response_enforcement == "off"
+
+
+class TestFinalResponseHeuristics:
+    def test_intention_without_action_is_rejected_for_operational_request(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I'll inspect the current directory and report back.",
+            messages=[{"role": "user", "content": "Check the current directory and tell me what's there."}],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_pure_conceptual_answer_is_allowed(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Explain what TCP is in simple terms.",
+            assistant_content="TCP is a transport protocol that provides reliable ordered delivery.",
+            messages=[{"role": "user", "content": "Explain what TCP is in simple terms."}],
+            tool_used_this_turn=False,
+        )
+        assert result is False
+
+    def test_explicit_blocked_boundary_is_allowed_with_tool_evidence(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Deploy this to production.",
+            assistant_content="I can't deploy this because I don't have the required production credentials.",
+            messages=[
+                {"role": "user", "content": "Deploy this to production."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "permission denied: missing credentials"},
+            ],
+            tool_used_this_turn=False,
+        )
+        assert result is False
+
+    def test_missing_credentials_claim_without_tool_evidence_is_rejected(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Deploy this to production.",
+            assistant_content="I can't deploy this because I don't have the required production credentials.",
+            messages=[{"role": "user", "content": "Deploy this to production."}],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_need_approval_phrase_without_evidence_is_not_auto_allowed(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I need approval before I inspect the current directory.",
+            messages=[{"role": "user", "content": "Check the current directory and tell me what's there."}],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_need_approval_with_tool_evidence_is_allowed(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I need approval before I inspect the current directory.",
+            messages=[
+                {"role": "user", "content": "Check the current directory and tell me what's there."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "approval required by policy"},
+            ],
+            tool_used_this_turn=False,
+        )
+        assert result is False
+
+    def test_old_credential_error_does_not_justify_new_blocked_final(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Deploy this to production.",
+            assistant_content="I can't deploy this because I don't have the required production credentials.",
+            messages=[
+                {"role": "user", "content": "Check an unrelated service."},
+                {"role": "assistant", "tool_calls": [{"id": "old1", "function": {"name": "terminal", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "old1", "content": "permission denied: missing credentials"},
+                {"role": "assistant", "content": "That unrelated check failed."},
+                {"role": "user", "content": "Deploy this to production."},
+            ],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_old_approval_error_does_not_justify_new_blocked_final(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I need approval before I inspect the current directory.",
+            messages=[
+                {"role": "user", "content": "Run an unrelated admin command."},
+                {"role": "assistant", "tool_calls": [{"id": "old1", "function": {"name": "terminal", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "old1", "content": "approval required by policy"},
+                {"role": "assistant", "content": "That unrelated admin command is blocked."},
+                {"role": "user", "content": "Check the current directory and tell me what's there."},
+            ],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_soft_blocked_phrase_is_not_treated_as_real_boundary(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I'm blocked by the next step being to inspect the current directory.",
+            messages=[{"role": "user", "content": "Check the current directory and tell me what's there."}],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_tool_used_turn_allows_text_final(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I found the relevant files and summarized them above.",
+            messages=[
+                {"role": "user", "content": "Check the current directory and tell me what's there."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "web_search", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "search result"},
+            ],
+            tool_used_this_turn=True,
+        )
+        assert result is False
+
+
 class TestBuildApiKwargs:
     def test_basic_kwargs(self, agent):
         messages = [{"role": "user", "content": "hi"}]
@@ -1735,6 +1891,217 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_rejected_narration_response_continues_until_tool_call(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(
+            content="I'll inspect the current directory and report back.",
+            finish_reason="stop",
+        )
+        resp2 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp3 = _mock_response(content="Done searching", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Check the current directory and tell me what's there.")
+
+        assert result["final_response"] == "Done searching"
+        assert result["api_calls"] == 3
+        assert mock_handle_function_call.call_count == 1
+
+    def test_blocked_response_without_tool_evidence_fails_closed(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="I can't deploy this because I don't have the required production credentials.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [resp, resp, resp]
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Deploy this to production.")
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "repeatedly responded with narration" in result["error"].lower()
+
+    def test_blocked_response_with_tool_evidence_is_allowed_without_retry(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(
+            content="I can't deploy this because I don't have the required production credentials.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        with (
+            patch("run_agent.handle_function_call", return_value="permission denied: missing credentials") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Deploy this to production.")
+        assert result["completed"] is True
+        assert result["final_response"] == "I can't deploy this because I don't have the required production credentials."
+        assert mock_handle_function_call.call_count == 1
+
+    def test_blocked_response_with_tool_evidence_survives_retry_wrapper(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="I'll summarize the deploy result.", finish_reason="stop")
+        resp3 = _mock_response(
+            content="I can't deploy this because I don't have the required production credentials.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+        with (
+            patch("run_agent.handle_function_call", return_value="permission denied: missing credentials") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Deploy this to production.")
+        assert result["completed"] is True
+        assert result["final_response"] == "I can't deploy this because I don't have the required production credentials."
+        assert mock_handle_function_call.call_count == 1
+
+    def test_same_turn_blocked_response_can_use_prior_tool_evidence_after_retries(self, agent):
+        self._setup_agent(agent)
+        old_tc = _mock_tool_call(name="web_search", arguments="{}", call_id="old1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[old_tc])
+        resp2 = _mock_response(content="I'll continue with the deployment now.", finish_reason="stop")
+        resp3 = _mock_response(content="I'll continue with the deployment now.", finish_reason="stop")
+        resp4 = _mock_response(
+            content="I can't deploy this because I don't have the required production credentials.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3, resp4]
+        with (
+            patch("run_agent.handle_function_call", return_value="permission denied: missing credentials") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Deploy this to production.")
+        assert result["completed"] is True
+        assert result["final_response"] == "I can't deploy this because I don't have the required production credentials."
+        assert mock_handle_function_call.call_count == 1
+
+    def test_repeated_narration_response_fails_closed(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="I'll inspect the current directory and report back.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [resp, resp, resp]
+        with (
+            patch.object(agent, "_persist_session") as mock_persist_session,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Check the current directory and tell me what's there.")
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "repeatedly responded with narration" in result["error"].lower()
+        persisted_messages = mock_persist_session.call_args.args[0]
+        assert persisted_messages[-1]["role"] == "assistant"
+        assert persisted_messages[-1]["content"] == "I'll inspect the current directory and report back."
+
+    def test_text_final_after_real_tool_usage_is_allowed(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="I found the relevant files and summarized them above.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        with (
+            patch("run_agent.handle_function_call", return_value="search result") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Check the current directory and tell me what's there.")
+        assert result["completed"] is True
+        assert result["final_response"] == "I found the relevant files and summarized them above."
+        assert mock_handle_function_call.call_count == 1
+        assert agent.client.chat.completions.create.call_count == 2
+
+    def test_text_final_after_blocked_tool_usage_is_still_rejected(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="I'll inspect the current directory and report back.", finish_reason="stop")
+        resp3 = _mock_response(content="I'll inspect the current directory and report back.", finish_reason="stop")
+        resp4 = _mock_response(content="I'll inspect the current directory and report back.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3, resp4]
+        with (
+            patch("run_agent.handle_function_call", return_value='{"error":"Blocked by policy"}') as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Check the current directory and tell me what's there.")
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "repeatedly responded with narration" in result["error"].lower()
+        assert mock_handle_function_call.call_count == 1
+
+    def test_tool_used_state_resets_on_later_text_only_iteration(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="I'll inspect the current directory and report back.", finish_reason="stop")
+        resp3 = _mock_response(content="I'll inspect the current directory and report back.", finish_reason="stop")
+        resp4 = _mock_response(content="I'll inspect the current directory and report back.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3, resp4]
+        with (
+            patch("run_agent.handle_function_call", return_value="search result") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Check the current directory and tell me what's there.")
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "repeatedly responded with narration" in result["error"].lower()
+        assert mock_handle_function_call.call_count == 1
+
+    def test_cancelled_tool_turn_does_not_disable_narration_rejection(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="I'll inspect the current directory and report back.", finish_reason="stop")
+        resp3 = _mock_response(content="I'll inspect the current directory and report back.", finish_reason="stop")
+        resp4 = _mock_response(content="I'll inspect the current directory and report back.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3, resp4]
+        with (
+            patch("run_agent.handle_function_call", return_value="[Tool execution cancelled — web_search was skipped due to user interrupt]") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_save_session_log"),
+        ):
+            result = agent.run_conversation("Check the current directory and tell me what's there.")
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "repeatedly responded with narration" in result["error"].lower()
+        assert mock_handle_function_call.call_count == 1
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
