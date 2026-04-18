@@ -11,7 +11,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-from hermes_cli.auth import AuthError, resolve_provider
+from hermes_cli.auth import AuthError, PROVIDER_REGISTRY, get_api_key_provider_status, resolve_provider
 from hermes_cli.colors import Colors, color
 from hermes_cli.config import get_env_path, get_env_value, get_hermes_home, load_config
 from hermes_cli.models import provider_label
@@ -237,21 +237,21 @@ def show_status(args):
     print()
     print(color("◆ API-Key Providers", Colors.CYAN, Colors.BOLD))
 
-    apikey_providers = {
-        "Z.AI / GLM":       ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"),
-        "Kimi / Moonshot":  ("KIMI_API_KEY",),
-        "MiniMax":          ("MINIMAX_API_KEY",),
-        "MiniMax (China)":  ("MINIMAX_CN_API_KEY",),
-    }
-    for pname, env_vars in apikey_providers.items():
-        key_val = ""
-        for ev in env_vars:
-            key_val = get_env_value(ev) or ""
-            if key_val:
-                break
-        configured = bool(key_val)
+    apikey_provider_ids = [
+        "zai",
+        "kimi-coding",
+        "minimax",
+        "minimax-cn",
+        "fireworks",
+    ]
+    for provider_id in apikey_provider_ids:
+        pconfig = PROVIDER_REGISTRY.get(provider_id)
+        if not pconfig or pconfig.auth_type != "api_key":
+            continue
+        provider_status = get_api_key_provider_status(provider_id)
+        configured = bool(provider_status.get("configured"))
         label = "configured" if configured else "not configured (run: hermes model)"
-        print(f"  {pname:<16} {check_mark(configured)} {label}")
+        print(f"  {pconfig.name:<16} {check_mark(configured)} {label}")
 
     # =========================================================================
     # Terminal Configuration

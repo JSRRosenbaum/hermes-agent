@@ -42,3 +42,36 @@ def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys,
     assert "Manager:      Termux / manual process" in output
     assert "Start with:   hermes gateway" in output
     assert "systemd (user)" not in output
+
+
+def test_show_status_includes_fireworks_api_key_provider(monkeypatch, capsys, tmp_path):
+    from hermes_cli import status as status_mod
+    import hermes_cli.auth as auth_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-test-key")
+    monkeypatch.setattr(status_mod, "get_env_path", lambda: tmp_path / ".env", raising=False)
+    monkeypatch.setattr(status_mod, "get_hermes_home", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(
+        status_mod,
+        "load_config",
+        lambda: {"model": {"default": "accounts/fireworks/models/glm-5", "provider": "fireworks"}},
+        raising=False,
+    )
+    monkeypatch.setattr(status_mod, "resolve_requested_provider", lambda requested=None: "fireworks", raising=False)
+    monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "fireworks", raising=False)
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_codex_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_qwen_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(
+        status_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="inactive\n", returncode=3),
+    )
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "◆ API-Key Providers" in output
+    assert "Fireworks AI" in output
+    assert "configured" in output

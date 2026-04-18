@@ -60,6 +60,36 @@ def test_auth_add_api_key_persists_manual_entry(tmp_path, monkeypatch):
     assert entry["access_token"] == "sk-or-manual"
 
 
+def test_auth_add_api_key_defaults_label_noninteractive(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "fireworks"
+        auth_type = "api-key"
+        api_key = "fw-manual"
+        label = None
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    def _unexpected_input(prompt: str) -> str:
+        raise AssertionError(f"input() should not be called in noninteractive mode: {prompt}")
+
+    monkeypatch.setattr("builtins.input", _unexpected_input)
+
+    auth_add_command(_Args())
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = payload["credential_pool"]["fireworks"]
+    entry = next(item for item in entries if item["source"] == "manual")
+    assert entry["label"] == "api-key-1"
+    assert entry["auth_type"] == "api_key"
+    assert entry["access_token"] == "fw-manual"
+
+
 def test_auth_add_anthropic_oauth_persists_pool_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
