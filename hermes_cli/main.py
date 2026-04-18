@@ -1031,6 +1031,7 @@ def select_provider_and_model(args=None):
         "copilot": "GitHub Copilot",
         "anthropic": "Anthropic",
         "gemini": "Google AI Studio",
+        "fireworks": "Fireworks AI",
         "zai": "Z.AI / GLM",
         "kimi-coding": "Kimi / Moonshot",
         "minimax": "MiniMax",
@@ -1074,6 +1075,7 @@ def select_provider_and_model(args=None):
         ("opencode-go", "OpenCode Go (open models, $10/month subscription)"),
         ("ai-gateway", "AI Gateway (Vercel — 200+ models, pay-per-use)"),
         ("alibaba", "Alibaba Cloud / DashScope Coding (Qwen + multi-provider)"),
+        ("fireworks", "Fireworks AI (open models + Fire Pass)"),
         ("xiaomi", "Xiaomi MiMo (MiMo-V2 models — pro, omni, flash)"),
     ]
 
@@ -1186,7 +1188,7 @@ def select_provider_and_model(args=None):
         _model_flow_anthropic(config, current_model)
     elif selected_provider == "kimi-coding":
         _model_flow_kimi(config, current_model)
-    elif selected_provider in ("gemini", "zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface", "xiaomi"):
+    elif selected_provider in ("gemini", "fireworks", "zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface", "xiaomi"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
     # ── Post-switch cleanup: clear stale OPENAI_BASE_URL ──────────────
@@ -1595,6 +1597,9 @@ def _model_flow_custom(config):
 
     try:
         base_url = input(f"API base URL [{current_url or 'e.g. https://api.example.com/v1'}]: ").strip()
+        if not sys.stdin.isatty():
+            print("Error: interactive terminal required for API key entry.")
+            return
         import getpass
         api_key = getpass.getpass(f"API key [{current_key[:8] + '...' if current_key else 'optional'}]: ").strip()
     except (KeyboardInterrupt, EOFError):
@@ -2452,6 +2457,9 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
     if not existing_key:
         print(f"No {pconfig.name} API key configured.")
         if key_env:
+            if not sys.stdin.isatty():
+                print("Error: interactive terminal required for API key entry.")
+                return
             try:
                 import getpass
                 new_key = getpass.getpass(f"{key_env} (or Enter to cancel): ").strip()
@@ -4474,7 +4482,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "gemini", "huggingface", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "xiaomi"],
+        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "gemini", "huggingface", "fireworks", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "xiaomi"],
         default=None,
         help="Inference provider (default: auto)"
     )

@@ -397,3 +397,67 @@ class TestCheckNousFreeTierCache:
     def test_cache_ttl_is_short(self):
         """TTL should be short enough to catch upgrades quickly (<=5 min)."""
         assert _FREE_TIER_CACHE_TTL <= 300
+
+
+class TestFireworksModelFetching:
+    def test_fetch_fireworks_collection_caps_pagination(self, monkeypatch):
+        from hermes_cli.models import _fetch_fireworks_collection
+
+        calls = []
+
+        class _Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                import json
+                return json.dumps(self._payload).encode()
+
+        def fake_urlopen(req, timeout=0):
+            calls.append(req.full_url)
+            idx = len(calls)
+            return _Resp({
+                "models": [{"name": f"accounts/fireworks/models/model-{idx}"}],
+                "nextPageToken": f"page-{idx}",
+            })
+
+        monkeypatch.setattr(_models_mod.urllib.request, "urlopen", fake_urlopen)
+        items = _fetch_fireworks_collection(
+            api_key="fw-test",
+            path="/v1/accounts/test/models",
+            items_key="models",
+        )
+
+        assert items is not None
+        assert len(calls) == 10
+
+    def test_provider_model_ids_fireworks_sanitizes_live_results(self, monkeypatch):
+        from hermes_cli.models import provider_model_ids, FIREWORKS_FIRE_PASS_MODELS
+
+        monkeypatch.setattr(
+            _models_mod,
+            "_fetch_fireworks_models",
+            lambda api_key=None, timeout=5.0: [
+                "accounts/fireworks/models/good-model",
+                "\x1b[31maccounts/fireworks/models/evil\x1b[0m",
+                "bad\nmodel",
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            lambda provider: {"api_key": "***", "base_url": "https://api.fireworks.ai/inference/v1"},
+        )
+
+        result = provider_model_ids("fireworks")
+
+        assert FIREWORKS_FIRE_PASS_MODELS[0] in result
+        assert "accounts/fireworks/models/good-model" in result
+        assert "accounts/fireworks/models/evil" in result
+        assert all("\x1b" not in model for model in result)
+        assert all("\n" not in model for model in result)

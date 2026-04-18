@@ -96,6 +96,7 @@ def _normalize_aux_provider(provider: Optional[str], *, for_vision: bool = False
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
 _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "gemini": "gemini-3-flash-preview",
+    "fireworks": "accounts/fireworks/models/glm-5",
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
     "minimax": "MiniMax-M2.7",
@@ -1997,16 +1998,22 @@ def _resolve_task_provider_model(
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
 
-        # Backwards compat: compression section has its own keys.
-        # The auxiliary.compression defaults to provider="auto", so treat
-        # both None and "auto" as "not explicitly configured".
-        if task == "compression" and (not cfg_provider or cfg_provider == "auto"):
+        if task == "compression":
             comp = config.get("compression", {}) if isinstance(config, dict) else {}
             if isinstance(comp, dict):
-                cfg_provider = comp.get("summary_provider", "").strip() or None
-                cfg_model = cfg_model or comp.get("summary_model", "").strip() or None
+                summary_provider = comp.get("summary_provider", "").strip() or None
+                summary_model = str(comp.get("summary_model", "")).strip() or None
                 _sbu = comp.get("summary_base_url") or ""
-                cfg_base_url = cfg_base_url or _sbu.strip() or None
+                summary_base_url = _sbu.strip() or None
+                if summary_provider and summary_provider != "auto":
+                    cfg_provider = summary_provider
+                    cfg_base_url = cfg_base_url or summary_base_url
+                    if summary_provider == "custom":
+                        cfg_model = cfg_model or summary_model
+                    else:
+                        cfg_model = cfg_model or None
+                elif (not cfg_provider or cfg_provider == "auto") and summary_model:
+                    cfg_model = cfg_model or summary_model
 
     # Env vars are backward-compat fallback only — config.yaml is primary.
     env_model = _get_auxiliary_env_override(task, "MODEL") if task else None
@@ -2021,6 +2028,26 @@ def _resolve_task_provider_model(
 
     if task:
         # Config.yaml is the primary source for per-task overrides.
+        if task == "compression":
+            try:
+                from hermes_cli.config import load_config
+                full_config = load_config()
+            except ImportError:
+                full_config = config
+            if isinstance(full_config, dict):
+                comp_full = full_config.get("compression", {})
+                if isinstance(comp_full, dict):
+                    summary_provider = str(comp_full.get("summary_provider", "")).strip() or None
+                    summary_model = str(comp_full.get("summary_model", "")).strip() or None
+                    summary_base_url = str(comp_full.get("summary_base_url") or "").strip() or None
+                    if summary_provider and summary_provider != "auto":
+                        return (
+                            "custom" if summary_base_url else summary_provider,
+                            summary_model if summary_provider == "custom" else None,
+                            summary_base_url if summary_provider == "custom" else None,
+                            None,
+                            resolved_api_mode,
+                        )
         if cfg_base_url:
             return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
         if cfg_provider and cfg_provider != "auto":
