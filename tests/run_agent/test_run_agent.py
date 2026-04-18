@@ -835,6 +835,162 @@ class TestInvalidateSystemPrompt:
         mock_store.load_from_disk.assert_called_once()
 
 
+class TestFinalResponseEnforcementConfig:
+    """Tests for the agent.final_response_enforcement config option."""
+
+    def _make_agent(self, final_response_enforcement="heuristic"):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal", "web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"final_response_enforcement": final_response_enforcement}},
+            ),
+        ):
+            a = AIAgent(
+                model="openai/gpt-4.1",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_default_is_heuristic(self):
+        agent = self._make_agent(final_response_enforcement="heuristic")
+        assert agent._final_response_enforcement == "heuristic"
+
+    def test_strict_is_loaded_from_config(self):
+        agent = self._make_agent(final_response_enforcement="strict")
+        assert agent._final_response_enforcement == "strict"
+
+    def test_false_like_values_disable_enforcement(self):
+        agent = self._make_agent(final_response_enforcement="off")
+        assert agent._final_response_enforcement == "off"
+
+
+class TestFinalResponseHeuristics:
+    def test_intention_without_action_is_rejected_for_operational_request(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I'll inspect the current directory and report back.",
+            messages=[{"role": "user", "content": "Check the current directory and tell me what's there."}],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_pure_conceptual_answer_is_allowed(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Explain what TCP is in simple terms.",
+            assistant_content="TCP is a transport protocol that provides reliable ordered delivery.",
+            messages=[{"role": "user", "content": "Explain what TCP is in simple terms."}],
+            tool_used_this_turn=False,
+        )
+        assert result is False
+
+    def test_explicit_blocked_boundary_is_allowed_with_tool_evidence(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Deploy this to production.",
+            assistant_content="I can't deploy this because I don't have the required production credentials.",
+            messages=[
+                {"role": "user", "content": "Deploy this to production."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "permission denied: missing credentials"},
+            ],
+            tool_used_this_turn=False,
+        )
+        assert result is False
+
+    def test_missing_credentials_claim_without_tool_evidence_is_rejected(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Deploy this to production.",
+            assistant_content="I can't deploy this because I don't have the required production credentials.",
+            messages=[{"role": "user", "content": "Deploy this to production."}],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_need_approval_phrase_without_evidence_is_not_auto_allowed(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I need approval before I inspect the current directory.",
+            messages=[{"role": "user", "content": "Check the current directory and tell me what's there."}],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_need_approval_with_tool_evidence_is_allowed(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I need approval before I inspect the current directory.",
+            messages=[
+                {"role": "user", "content": "Check the current directory and tell me what's there."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "approval required by policy"},
+            ],
+            tool_used_this_turn=False,
+        )
+        assert result is False
+
+    def test_old_credential_error_does_not_justify_new_blocked_final(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Deploy this to production.",
+            assistant_content="I can't deploy this because I don't have the required production credentials.",
+            messages=[
+                {"role": "user", "content": "Check an unrelated service."},
+                {"role": "assistant", "tool_calls": [{"id": "old1", "function": {"name": "terminal", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "old1", "content": "permission denied: missing credentials"},
+                {"role": "assistant", "content": "That unrelated check failed."},
+                {"role": "user", "content": "Deploy this to production."},
+            ],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_old_approval_error_does_not_justify_new_blocked_final(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I need approval before I inspect the current directory.",
+            messages=[
+                {"role": "user", "content": "Run an unrelated admin command."},
+                {"role": "assistant", "tool_calls": [{"id": "old1", "function": {"name": "terminal", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "old1", "content": "approval required by policy"},
+                {"role": "assistant", "content": "That unrelated admin command is blocked."},
+                {"role": "user", "content": "Check the current directory and tell me what's there."},
+            ],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_soft_blocked_phrase_is_not_treated_as_real_boundary(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I'm blocked by the next step being to inspect the current directory.",
+            messages=[{"role": "user", "content": "Check the current directory and tell me what's there."}],
+            tool_used_this_turn=False,
+        )
+        assert result is True
+
+    def test_tool_used_turn_allows_text_final(self, agent):
+        result = agent._should_reject_final_text_response(
+            user_message="Check the current directory and tell me what's there.",
+            assistant_content="I found the relevant files and summarized them above.",
+            messages=[
+                {"role": "user", "content": "Check the current directory and tell me what's there."},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "web_search", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "search result"},
+            ],
+            tool_used_this_turn=True,
+        )
+        assert result is False
+
+
 class TestBuildApiKwargs:
     def test_basic_kwargs(self, agent):
         messages = [{"role": "user", "content": "hi"}]
