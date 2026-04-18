@@ -23,6 +23,7 @@ import tempfile
 import time
 import uuid
 import textwrap
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
@@ -1892,7 +1893,27 @@ class HermesCLI:
             return text[: max_len - 1].rstrip() + "…"
         return text
 
+    def _ensure_runtime_title_state(self) -> None:
+        """Initialize runtime-title attrs for __new__-built stubs and partial objects."""
+        if not hasattr(self, "_title_topic"):
+            self._title_topic = "Idle"
+        if not hasattr(self, "_title_status"):
+            self._title_status = "waiting"
+        if not hasattr(self, "_last_prompt_topic"):
+            self._last_prompt_topic = ""
+        if not hasattr(self, "_last_emitted_terminal_title"):
+            self._last_emitted_terminal_title = ""
+        if not hasattr(self, "_title_spin_index"):
+            self._title_spin_index = 0
+        if not hasattr(self, "_title_animating"):
+            self._title_animating = False
+        if not hasattr(self, "_title_spinner_frames"):
+            self._title_spinner_frames = ("◴", "◷", "◶", "◵")
+        if not hasattr(self, "_title_idle_icon"):
+            self._title_idle_icon = "★"
+
     def _get_session_title_for_runtime(self) -> Optional[str]:
+        self._ensure_runtime_title_state()
         if not getattr(self, "_session_db", None) or not getattr(self, "session_id", None):
             return None
         try:
@@ -1909,6 +1930,7 @@ class HermesCLI:
 
     def _runtime_title_prefix(self) -> str:
         """Return animated spinner prefix for active states, star for idle/complete."""
+        self._ensure_runtime_title_state()
         status = getattr(self, "_title_status", "waiting") or "waiting"
         if status in {"thinking", "working", "tool", "command", "voice"}:
             frames = getattr(self, "_title_spinner_frames", ("*",))
@@ -1917,11 +1939,12 @@ class HermesCLI:
         return getattr(self, "_title_idle_icon", "★")
 
     def _compose_runtime_title(self) -> str:
+        self._ensure_runtime_title_state()
         topic = (
             self._get_session_title_for_runtime()
             or getattr(self, "_pending_title", None)
-            or self._title_topic
-            or self._last_prompt_topic
+            or getattr(self, "_title_topic", "Idle")
+            or getattr(self, "_last_prompt_topic", "")
             or "Idle"
         )
         topic = self._summarize_runtime_topic(topic)
@@ -1930,6 +1953,7 @@ class HermesCLI:
 
     def _title_animation_loop(self) -> None:
         """Animate terminal-title spinner while Hermes is active."""
+        self._ensure_runtime_title_state()
         while getattr(self, "_title_animating", False):
             try:
                 self._title_spin_index = (getattr(self, "_title_spin_index", 0) + 1) % len(self._title_spinner_frames)
@@ -1940,6 +1964,7 @@ class HermesCLI:
                 break
 
     def _sync_title_animation(self) -> None:
+        self._ensure_runtime_title_state()
         animated = (getattr(self, "_title_status", "waiting") or "waiting") in {"thinking", "working", "tool", "command", "voice"}
         if animated and not getattr(self, "_title_animating", False):
             self._title_animating = True
@@ -1951,6 +1976,7 @@ class HermesCLI:
 
     def _emit_terminal_title(self) -> None:
         """Best-effort terminal/tab title refresh without writing into TUI stdout."""
+        self._ensure_runtime_title_state()
         title = self._compose_runtime_title()
         if title == getattr(self, "_last_emitted_terminal_title", ""):
             return
@@ -1979,12 +2005,18 @@ class HermesCLI:
 
         if emitted and os.environ.get("TMUX"):
             try:
-                os.system(f"tmux rename-window {json.dumps(title)} >/dev/null 2>&1")
+                subprocess.run(
+                    ["tmux", "rename-window", title],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             except Exception:
                 pass
 
     def _set_runtime_status_from_state(self) -> None:
         """Derive runtime status from the current interactive state."""
+        self._ensure_runtime_title_state()
         if getattr(self, "_secret_state", None):
             status = "waiting"
         elif getattr(self, "_sudo_state", None):
@@ -2009,6 +2041,7 @@ class HermesCLI:
 
     def _refresh_runtime_title(self, *, topic: Optional[str] = None, status: Optional[str] = None) -> None:
         """Update topic/status and refresh the terminal title."""
+        self._ensure_runtime_title_state()
         if topic is not None:
             summarized = self._summarize_runtime_topic(topic)
             self._title_topic = summarized
@@ -6732,7 +6765,7 @@ class HermesCLI:
             return
         if function_name and not function_name.startswith("_"):
             import time as _time
-            from agent.display import get_tool_emoji
+            from agent.display import get_skin_tool_prefix, get_tool_emoji
             emoji = get_tool_emoji(function_name)
             label = preview or function_name
             from agent.display import get_tool_preview_max_len
@@ -6741,6 +6774,19 @@ class HermesCLI:
                 label = label[:_pl - 3] + "..."
             self._spinner_text = f"{emoji} {label}"
             self._tool_start_time = _time.monotonic()
+
+            mode = str(getattr(self, "tool_progress_mode", "all") or "all").lower()
+            if mode in {"all", "new", "verbose"}:
+                seen = getattr(self, "_tool_progress_seen", None)
+                if seen is None:
+                    seen = set()
+                    self._tool_progress_seen = seen
+                progress_key = (function_name, label)
+                if mode != "new" or progress_key not in seen:
+                    seen.add(progress_key)
+                    prefix = get_skin_tool_prefix()
+                    _cprint(f"  {prefix} {emoji} {label}")
+
             self._refresh_runtime_title(status="tool")
             self._invalidate()
 
